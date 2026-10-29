@@ -1,0 +1,691 @@
+%% rx_desde_spice.m
+%% rx_desde_spice.m
+% Canal real + anti-alias + ADC + receptor PSoC sobre salida de LTspice
+% Requiere: salida.txt y tx_info.mat
+% Todas las graficas usan datos posteriores a 30 ms.
+
+clear; clc; close all; rng(3);
+load('tx_info.mat');                         % lI lQ tlead Tsym M Fs fc N
+
+sym = lI + 1j*lQ;
+Ts = 1/Fs;
+t_inicio_graf = 30e-3;                       % 30 ms
+
+try
+    D = readmatrix('salida.txt','NumHeaderLines',1);
+catch
+    D = dlmread('salida.txt','',1,0);
+end
+
+[t, iu] = unique(D(:,1), 'stable');
+s = D(iu,2);
+
+Fh = 16*Fs;
+R = Fh/Fs;
+
+th = (0:1/Fh:tlead+(N+2)*Tsym).';
+sh = interp1(t, s, th, 'linear', 0);
+
+if th(end) <= t_inicio_graf
+    error('La senal termina antes de 30 ms. No hay datos para graficar.');
+end
+
+t_sym = tlead + (0:N-1)'*Tsym;
+idxCal = find(t_sym >= t_inicio_graf);
+
+if numel(idxCal) < 10
+    error('No hay suficientes simbolos despues de 30 ms para calibrar.');
+end
+
+% --- Calibracion: solo sobre la zona estable ---
+bestRes = inf;
+delay = 0;
+gBest = 1;
+
+for dl = 0:Tsym/80:0.4*Tsym
+    zCal = zeros(numel(idxCal),1);
+
+    for k = 1:numel(idxCal)
+        i = idxCal(k);
+        a = round((tlead + (i-1)*Tsym + dl)*Fh) + 1;
+        w = a:a+M*R-1;
+
+        if w(end) > numel(sh)
+            error('Muestras insuficientes para calibrar el simbolo %d.', i);
+        end
+
+        zCal(k) = 2*mean(sh(w).*exp(-2j*pi*fc*th(w)));
+    end
+
+    g = (sym(idxCal)'*zCal)/(sym(idxCal)'*sym(idxCal));
+    res = norm(zCal - g*sym(idxCal))/norm(zCal);
+
+    if res < bestRes
+        bestRes = res;
+        delay = dl;
+        gBest = g;
+    end
+end
+
+K0 = abs(gBest);
+
+% Recalcular todos los simbolos con el mejor retardo
+z = zeros(N,1);
+for i = 1:N
+    a = round((tlead + (i-1)*Tsym + delay)*Fh) + 1;
+    w = a:a+M*R-1;
+
+    if w(end) > numel(sh)
+        error('Muestras insuficientes para procesar el simbolo %d.', i);
+    end
+
+    z(i) = 2*mean(sh(w).*exp(-2j*pi*fc*th(w)));
+end
+
+zcal = z / gBest;
+
+fprintf('Retardo del simbolo: %.1f us | K0 = %.3f V/nivel | residuo ideal = %.3f\n', ...
+    delay*1e6, K0, bestRes);
+
+% Receptor: procesa todos los simbolos
+res_ideal = canal_rx(true, sh, th, delay, K0, ...
+    lI, lQ, tlead, Tsym, M, Fs, fc, N, t_inicio_graf);
+
+res_real = canal_rx(false, sh, th, delay, K0, ...
+    lI, lQ, tlead, Tsym, M, Fs, fc, N, t_inicio_graf);
+
+%% FIGURA 1: transmisor, espectro y constelacion
+idx30 = find(th >= t_inicio_graf);
+th30 = th(idx30);
+sh30 = sh(idx30);
+
+figure(1); clf;
+set(gcf,'Color','w','Name','TX LM1496 - posterior a 30 ms');
+
+subplot(1,3,1);
+plot(th30*1e3, sh30);
+grid on;
+xlim([t_inicio_graf*1e3 th30(end)*1e3]);
+title('s(t): posterior a 30 ms');
+xlabel('Tiempo (ms)');
+ylabel('V');
+
+shspec = sh30;
+L = 2^nextpow2(numel(shspec));
+hw = 0.5 - 0.5*cos(2*pi*(0:numel(shspec)-1)'/max(numel(shspec)-1,1));
+S = abs(fft(shspec.*hw, L)).^2;
+f = (0:L/2-1)*Fh/L/1e3;
+Sdb = 10*log10(S(1:L/2)/max(S(1:L/2)) + 1e-12);
+
+subplot(1,3,2);
+plot(f, Sdb);
+grid on;
+xlim([0 250]);
+ylim([-80 3]);
+title('Espectro desde 30 ms');
+xlabel('Frecuencia (kHz)');
+ylabel('dB');
+
+isym30 = find(t_sym >= t_inicio_graf);
+[Lx, Ly] = meshgrid([-3 -1 1 3]);
+
+subplot(1,3,3);
+plot(real(zcal(isym30)), imag(zcal(isym30)), '.');
+hold on;
+plot(Lx(:), Ly(:), 'r+');
+axis equal;
+grid on;
+xlim([-5 5]);
+ylim([-5 5]);
+title('Constelacion ideal desde 30 ms');
+xlabel('I');
+ylabel('Q');
+
+%% FIGURAS 2 y 3: receptor, solo desde 30 ms
+graficar(res_ideal, 2, 'IDEAL', Tsym, tlead, t_inicio_graf);
+graficar(res_real, 3, 'REAL', Tsym, tlead, t_inicio_graf);
+
+%% FUNCIONES LOCALES
+
+function Rs = canal_rx(ideal, sh, th, delay, K0, lI, lQ, ...
+    tlead, Tsym, M, Fs, fc, N, t_inicio_graf)
+
+    sym = lI + 1j*lQ;
+    Fh = 16*Fs;
+    R = 16;
+
+    Ntr = min(150, N);
+    EsN0dB = 25;
+    Pref = 10;
+
+    al = ones(N,1);
+    if ~ideal
+        al(201:min(320,N)) = 0.5;
+        if N >= 321
+            al(321:min(430,N)) = 0.3;
+        end
+    end
+
+    alh = [ones(round(tlead*Fh),1); repelem(al, M*R); ones(numel(th),1)];
+    alh = alh(1:numel(th));
+    r = alh .* sh;
+
+    if ~ideal
+        sig2c = Pref/10^(EsN0dB/10)/2;
+        sn = sqrt(sig2c*K0^2*M/2);
+        r = r + sn*sqrt(R)*randn(size(r));
+    end
+
+    aL = exp(-2*pi*2*fc/Fh);
+    r = filter(1-aL, [1 -aL], filter(1-aL, [1 -aL], r));
+    r = r(1:R:end);
+    tadc = th(1:R:end);
+
+    if ideal
+        frx = fc;
+        th0 = 0;
+    else
+        frx = fc - 0.5;
+        th0 = 0.6;
+    end
+
+    Vfs = 4.096;
+    lsb = 2*Vfs/4096;
+    pgal = [1 2 4 8 16 24 32 48];
+
+    aP = 0.05;
+    mu = 0.05;
+    zeta = 0.707;
+    BnT = 0.01;
+
+    tt = BnT/(zeta + 1/(4*zeta));
+    d = 1 + 2*zeta*tt + tt^2;
+    Kp = 4*zeta*tt/d;
+    Ki = 4*tt^2/d;
+
+    sl = @(x) min(max(2*floor(x/2)+1, -3), 3);
+
+    n0 = round((tlead + delay)/Ts) + 1;
+
+    gh = [0 0];
+    ph = [0 0];
+    g = 0;
+    Pm = Pref;
+    phi = 0;
+    integ = 0;
+
+    z = zeros(N,1);
+    dec = zeros(N,1);
+    G = zeros(N,1);
+    PG = zeros(N,1);
+    PM = zeros(N,1);
+    PH = zeros(N,1);
+    TH = zeros(N,1);
+
+    for i = 1:N
+        gp = gh(1);
+        pp = ph(1);
+
+        lin = 10^(gp/20);
+        pga = max(pgal(pgal <= max(lin,1)));
+        gd = lin/pga;
+
+        idx = n0 + (i-1)*M + (0:M-1);
+
+        if idx(1) < 1 || idx(end) > numel(r)
+            error('Muestras insuficientes para procesar el simbolo %d.', i);
+        end
+
+        x = round(min(max(pga*r(idx), -Vfs), Vfs)/lsb) * lsb * gd;
+        arg = 2*pi*frx*tadc(idx) - th0 + pp;
+        z(i) = (2/M) * sum(x .* exp(-1j*arg)) / K0;
+
+        Pm = (1-aP)*Pm + aP*abs(z(i))^2;
+        g = min(max(g + mu*(10*log10(Pref) - 10*log10(Pm)), -6), 40);
+
+        if i <= Ntr
+            dd = sym(i);
+        else
+            dd = sl(real(z(i))) + 1j*sl(imag(z(i)));
+        end
+
+        e = imag(z(i)*conj(dd))/abs(dd)^2;
+        integ = integ + Ki*e;
+        phi = phi + Kp*e + integ;
+
+        dec(i) = dd;
+        G(i) = g;
+        PG(i) = 20*log10(pga);
+        PM(i) = Pm;
+        PH(i) = phi;
+        TH(i) = 2*pi*(fc-frx)*tadc(idx(1)+floor(M/2)) + th0;
+
+        gh = [gh(2) g];
+        ph = [ph(2) phi];
+    end
+
+    Rs.z = z;
+    Rs.err = (dec ~= sym) & ((1:N).' > Ntr);
+    Rs.alpha = al;
+    Rs.G = G;
+    Rs.PG = PG;
+    Rs.PM = PM;
+    Rs.PH = PH;
+    Rs.TH = TH;
+    Rs.ser = movmean(double(Rs.err), 40) * 100;
+    Rs.Pref = Pref;
+
+    if N > Ntr
+        fprintf('%s: errores de simbolo = %d / %d (%.2f %%)\n', ...
+            ternary(ideal, 'IDEAL', 'REAL '), sum(Rs.err), N-Ntr, ...
+            mean(Rs.err(Ntr+1:end))*100);
+    else
+        fprintf('%s: no hay simbolos posteriores al entrenamiento.\n', ...
+            ternary(ideal, 'IDEAL', 'REAL '));
+    end
+end
+
+function o = ternary(c, a, b)
+    if c
+        o = a;
+    else
+        o = b;
+    end
+end
+
+function graficar(Rs, fig, nm, Tsym, tlead, t_inicio)
+
+    N = numel(Rs.G);
+    t_ms = (tlead + (0:N-1)'*Tsym) * 1e3;
+    [Lx, Ly] = meshgrid([-3 -1 1 3]);
+
+    iv = find(t_ms >= t_inicio*1e3);
+    if isempty(iv)
+        error('No hay simbolos posteriores a %.1f ms.', t_inicio*1e3);
+    end
+
+    tv = t_ms(iv);
+
+    figure(fig); clf;
+    set(gcf, 'Color', 'w', 'Name', ['Receptor ' nm]);
+
+    subplot(3,2,1);
+    plot(tv, 20*log10(max(Rs.alpha(iv), eps)), 'r', ...
+        tv, Rs.G(iv), 'b', ...
+        tv, Rs.PG(iv), 'g');
+    grid on;
+    xlim([t_inicio*1e3 max(tv)]);
+    title('AGC / PGA');
+    xlabel('Tiempo (ms)');
+    ylabel('dB');
+    legend('\alpha', 'AGC total', 'PGA', 'Location', 'best');
+
+    subplot(3,2,2);
+    plot(real(Rs.z(iv)), imag(Rs.z(iv)), '.');
+    hold on;
+    plot(Lx(:), Ly(:), 'r+');
+    axis equal;
+    grid on;
+    xlim([-5 5]);
+    ylim([-5 5]);
+    title('Constelacion');
+    xlabel('I');
+    ylabel('Q');
+
+    subplot(3,2,3);
+    plot(tv, Rs.PM(iv), 'k');
+    grid on;
+    xlim([t_inicio*1e3 max(tv)]);
+    title('Potencia media');
+    xlabel('Tiempo (ms)');
+    ylabel('P');
+
+    subplot(3,2,4);
+    plot(tv, Rs.ser(iv), 'm');
+    grid on;
+    xlim([t_inicio*1e3 max(tv)]);
+    ylim([0 100]);
+    title('SER movil');
+    xlabel('Tiempo (ms)');
+    ylabel('%');
+
+    subplot(3,2,5);
+    plot(tv, Rs.PH(iv), 'm', tv, Rs.TH(iv), 'c');
+    grid on;
+    xlim([t_inicio*1e3 max(tv)]);
+    title('Fase / error de portadora');
+    xlabel('Tiempo (ms)');
+    ylabel('rad');
+    legend('\phi', '\theta', 'Location', 'best');
+
+    subplot(3,2,6);
+    stem(tv, double(Rs.err(iv)), 'filled');
+    grid on;
+    xlim([t_inicio*1e3 max(tv)]);
+    ylim([-0.1 1.1]);
+    title('Errores de simbolo');
+    xlabel('Tiempo (ms)');
+    ylabel('Error');
+
+end
+% Canal real + anti-alias + ADC + receptor PSoC sobre salida de LTspice
+% Requiere: salida.txt y tx_info.mat
+% Todas las graficas usan datos posteriores a 30 ms.
+
+clear; clc; close all; rng(3);
+load('tx_info.mat');                         % lI lQ tlead Tsym M Fs fc N
+
+sym = lI + 1j*lQ;
+Ts = 1/Fs;
+t_inicio_graf = 30e-3;                       % 30 ms
+
+try
+    D = readmatrix('salida.txt','NumHeaderLines',1);
+catch
+    D = dlmread('salida.txt','',1,0);
+end
+
+[t, iu] = unique(D(:,1));
+s = D(iu,2);
+
+Fh = 16*Fs;
+R = Fh/Fs;
+
+th = (0:1/Fh:tlead+(N+2)*Tsym).';
+sh = interp1(t,s,th,'linear',0);
+
+% Comprobar que existan datos despues de 30 ms
+if th(end) <= t_inicio_graf
+    error('La senal termina antes de 30 ms. No hay datos para graficar.');
+end
+
+t_sym = tlead + (0:N-1)'*Tsym;
+idxCal = find(t_sym >= t_inicio_graf);
+
+if numel(idxCal) < 10
+    error('No hay suficientes simbolos despues de 30 ms para calibrar.');
+end
+
+% --- Calibracion: solo sobre la zona estable ---
+bestRes = inf;
+delay = 0;
+gBest = 1;
+
+for dl = 0:Tsym/80:0.4*Tsym
+    zCal = zeros(numel(idxCal),1);
+
+    for k = 1:numel(idxCal)
+        i = idxCal(k);
+        a = round((tlead + (i-1)*Tsym + dl)*Fh) + 1;
+        w = a:a+M*R-1;
+
+        if w(end) > numel(sh)
+            error('Muestras insuficientes para calibrar el simbolo %d.', i);
+        end
+
+        zCal(k) = 2*mean(sh(w).*exp(-2j*pi*fc*th(w)));
+    end
+
+    g = (sym(idxCal)'*zCal)/(sym(idxCal)'*sym(idxCal));
+    res = norm(zCal - g*sym(idxCal))/norm(zCal);
+
+    if res < bestRes
+        bestRes = res;
+        delay = dl;
+        gBest = g;
+    end
+end
+
+K0 = abs(gBest);
+
+% Recalcular todos los simbolos con el mejor retardo
+z = zeros(N,1);
+for i = 1:N
+    a = round((tlead + (i-1)*Tsym + delay)*Fh) + 1;
+    w = a:a+M*R-1;
+
+    if w(end) > numel(sh)
+        error('Muestras insuficientes para procesar el simbolo %d.', i);
+    end
+
+    z(i) = 2*mean(sh(w).*exp(-2j*pi*fc*th(w)));
+end
+
+zcal = z / gBest;
+
+fprintf('Retardo del simbolo: %.1f us | K0 = %.3f V/nivel | residuo ideal = %.3f\n', ...
+    delay*1e6, K0, bestRes);
+
+% Receptor: procesa todos los simbolos
+res_ideal = canal_rx(true,sh,th,delay,K0, ...
+    lI,lQ,tlead,Tsym,M,Fs,fc,N,t_inicio_graf);
+
+res_real = canal_rx(false,sh,th,delay,K0, ...
+    lI,lQ,tlead,Tsym,M,Fs,fc,N,t_inicio_graf);
+
+%% FIGURA 1: transmisor, espectro y constelacion
+% Las tres graficas usan datos posteriores a 30 ms.
+
+idx30 = find(th >= t_inicio_graf);
+th30 = th(idx30);
+sh30 = sh(idx30);
+
+figure(1); clf;
+set(gcf,'Color','w','Name','TX LM1496 - posterior a 30 ms');
+
+% 1. Senal temporal
+subplot(1,3,1);
+plot(th30*1e3, sh30);
+grid on;
+xlim([t_inicio_graf*1e3 th30(end)*1e3]);
+title('s(t): posterior a 30 ms');
+xlabel('Tiempo (ms)');
+ylabel('V');
+
+% 2. Espectro calculado solo con muestras posteriores a 30 ms
+shspec = sh30;
+L = 2^nextpow2(numel(shspec));
+hw = 0.5 - 0.5*cos(2*pi*(0:numel(shspec)-1)'/max(numel(shspec)-1,1));
+S = abs(fft(shspec.*hw, L)).^2;
+f = (0:L/2-1)*Fh/L/1e3;
+Sdb = 10*log10(S(1:L/2)/max(S(1:L/2)) + 1e-12);
+
+subplot(1,3,2);
+plot(f, Sdb);
+grid on;
+xlim([0 250]);
+ylim([-80 3]);
+title('Espectro desde 30 ms');
+xlabel('Frecuencia (kHz)');
+ylabel('dB');
+
+% 3. Constelacion: simbolos cuyos instantes estan despues de 30 ms
+isym30 = find(t_sym >= t_inicio_graf);
+[Lx, Ly] = meshgrid([-3 -1 1 3]);
+
+subplot(1,3,3);
+plot(real(zcal(isym30)), imag(zcal(isym30)), '.');
+hold on;
+plot(Lx(:), Ly(:), 'r+');
+axis equal;
+grid on;
+xlim([-5 5]);
+ylim([-5 5]);
+title('Constelacion ideal desde 30 ms');
+xlabel('I');
+ylabel('Q');
+
+%% FIGURAS 2 y 3: receptor, solo desde 30 ms
+graficar(res_ideal,2,'IDEAL',Tsym,tlead,t_inicio_graf);
+graficar(res_real,3,'REAL',Tsym,tlead,t_inicio_graf);
+
+%% FUNCIONES LOCALES
+
+function Rs = canal_rx(ideal,sh,th,delay,K0,lI,lQ, ...
+    tlead,Tsym,M,Fs,fc,N,t_inicio_graf)
+
+    sym = lI + 1j*lQ;
+    Fh = 16*Fs;
+    R = 16;
+
+    Ntr = min(150,N);
+    EsN0dB = 25;
+    Pref = 10;
+
+    al = ones(N,1);
+    if ~ideal
+        al(201:min(320,N)) = 0.5;
+        if N >= 321
+            al(321:min(430,N)) = 0.3;
+        end
+    end
+
+    alh = [ones(round(tlead*Fh),1); repelem(al,M*R); ones(numel(th),1)];
+    alh = alh(1:numel(th));
+    r = alh.*sh;
+
+    if ~ideal
+        sig2c = Pref/10^(EsN0dB/10)/2;
+        sn = sqrt(sig2c*K0^2*M/2);
+        r = r + sn*sqrt(R)*randn(size(r));
+    end
+
+    aL = exp(-2*pi*2*fc/Fh);
+    r = filter(1-aL,[1 -aL],filter(1-aL,[1 -aL],r));
+    r = r(1:R:end);
+    tadc = th(1:R:end);
+
+    if ideal
+        frx = fc;
+        th0 = 0;
+    else
+        frx = fc - 0.5;
+        th0 = 0.6;
+    end
+
+    Vfs = 4.096;
+    lsb = 2*Vfs/4096;
+    pgal = [1 2 4 8 16 24 32 48];
+
+    aP = 0.05;
+    mu = 0.05;
+    zeta = 0.707;
+    BnT = 0.01;
+
+    tt = BnT/(zeta + 1/(4*zeta));
+    d = 1 + 2*zeta*tt + tt^2;
+    Kp = 4*zeta*tt/d;
+    Ki = 4*tt^2/d;
+
+    sl = @(x) min(max(2*floor(x/2)+1,-3),3);
+
+    n0 = round((tlead + delay)/Ts) + 1;
+
+    gh = [0 0];
+    ph = [0 0];
+    g = 0;
+    Pm = Pref;
+    phi = 0;
+    integ = 0;
+
+    z = zeros(N,1);
+    dec = zeros(N,1);
+    G = zeros(N,1);
+    PG = zeros(N,1);
+    PM = zeros(N,1);
+    PH = zeros(N,1);
+    TH = zeros(N,1);
+
+    for i = 1:N
+        gp = gh(1);
+        pp = ph(1);
+
+        lin = 10^(gp/20);
+        pga = max(pgal(pgal <= max(lin,1)));
+        gd = lin/pga;
+
+        idx = n0 + (i-1)*M + (0:M-1);
+
+        if idx(1) < 1 || idx(end) > numel(r)
+            error('Muestras insuficientes para procesar el simbolo %d.', i);
+        end
+
+        x = round(min(max(pga*r(idx),-Vfs),Vfs)/lsb)*lsb*gd;
+        arg = 2*pi*frx*tadc(idx) - th0 + pp;
+        z(i) = (2/M)*sum(x.*exp(-1j*arg))/K0;
+
+        Pm = (1-aP)*Pm + aP*abs(z(i))^2;
+        g = min(max(g + mu*(10*log10(Pref) - 10*log10(Pm)),-6),40);
+
+        if i <= Ntr
+            dd = sym(i);
+        else
+            dd = sl(real(z(i))) + 1j*sl(imag(z(i)));
+        end
+
+        e = imag(z(i)*conj(dd))/abs(dd)^2;
+        integ = integ + Ki*e;
+        phi = phi + Kp*e + integ;
+
+        dec(i) = dd;
+        G(i) = g;
+        PG(i) = 20*log10(pga);
+        PM(i) = Pm;
+        PH(i) = phi;
+        TH(i) = 2*pi*(fc-frx)*tadc(idx(1)+floor(M/2)) + th0;
+
+        gh = [gh(2) g];
+        ph = [ph(2) phi];
+    end
+
+    Rs.z = z;
+    Rs.err = (dec ~= sym) & ((1:N).' > Ntr);
+    Rs.alpha = al;
+    Rs.G = G;
+    Rs.PG = PG;
+    Rs.PM = PM;
+    Rs.PH = PH;
+    Rs.TH = TH;
+    Rs.ser = movmean(double(Rs.err),40)*100;
+    Rs.Pref = Pref;
+
+    if N > Ntr
+        fprintf('%s: errores de simbolo = %d / %d (%.2f %%)\n', ...
+            ternary(ideal,'IDEAL','REAL '), sum(Rs.err), N-Ntr, ...
+            mean(Rs.err(Ntr+1:end))*100);
+    else
+        fprintf('%s: no hay simbolos posteriores al entrenamiento.\n', ...
+            ternary(ideal,'IDEAL','REAL '));
+    end
+end
+
+function o = ternary(c,a,b)
+    if c
+        o = a;
+    else
+        o = b;
+    end
+end
+
+function graficar(Rs,fig,nm,Tsym,tlead,t_inicio)
+
+    N = numel(Rs.G);
+    t_ms = (tlead + (0:N-1)'*Tsym)*1e3;
+    [Lx, Ly] = meshgrid([-3 -1 1 3]);
+
+    iv = find(t_ms >= t_inicio*1e3);
+    if isempty(iv)
+        error('No hay simbolos posteriores a %.1f ms.', t_inicio*1e3);
+    end
+
+    tv = t_ms(iv);
+
+    figure(fig); clf;
+    set(gcf,'Color','w','Name',['Receptor ' nm]);
+
+    subplot(3,2,1);
+    plot(tv,20*log10(max(Rs.alpha(iv),eps)),'r', ...
+        tv,Rs.G(iv),'b',tv,Rs.PG(iv),'g');
+    grid on;
+    xlim([t_inicio*1e3 max(tv)]);
+    legend('\alpha','AGC total','PGA','Location','best');
