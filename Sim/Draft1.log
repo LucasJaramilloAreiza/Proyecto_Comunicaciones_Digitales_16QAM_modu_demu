@@ -1,0 +1,6 @@
+LTspice 26.0.2 for Windows
+Circuit: C:\Users\LUCASJARAMILLOAREIZA\Documents\MATLAB\ComsDigitales\Sim\Draft1.net
+Start Time: Thu Oct 29 04:27:50 2026
+C:\Users\LUCASJARAMILLOAREIZA\Documents\MATLAB\ComsDigitales\Sim\Draft1.net(2): This sub-circuit name is not defined.
+X§U1 v2 v1 10v -12v Vout opamp2 ;§pnba In+)In-)V+)V-)OUT
+                         ^^^^^^
