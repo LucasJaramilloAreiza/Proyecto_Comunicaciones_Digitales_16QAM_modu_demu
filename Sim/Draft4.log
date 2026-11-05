@@ -1,0 +1,15 @@
+LTspice 26.0.2 for Windows
+Circuit: C:\Users\LUCASJARAMILLOAREIZA\Documents\MATLAB\ComsDigitales\Sim\Draft4.net
+Start Time: Thu Oct 29 06:51:44 2026
+solver = Normal
+Maximum thread count: 6
+tnom = 27
+temp = 27
+method = trap
+Direct Newton iteration succeeded in finding operating point.
+Total elapsed time: 0.448 seconds.
+
+Files loaded:
+C:\Users\LUCASJARAMILLOAREIZA\Documents\MATLAB\ComsDigitales\Sim\Draft4.net
+C:\Users\LUCASJARAMILLOAREIZA\AppData\Local\LTspice\lib\sub\UniversalOpAmp3a.lib
+
